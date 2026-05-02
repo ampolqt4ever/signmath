@@ -7,7 +7,7 @@ import time
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 GESTURES = ["one", "two", "plus", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]
 SEQUENCE_LENGTH = 30        # frames per sample
-SAMPLES_PER_CLASS = 50      # samples per gesture
+SAMPLES_PER_CLASS = 600      # samples per gesture
 DATASET_DIR = "dataset"
 LANDMARK_SIZE = 126         # always 126: 2 hands × 21 landmarks × 3 (x,y,z)
                             # if only 1 hand visible, second hand = zeros

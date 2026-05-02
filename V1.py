@@ -3,15 +3,27 @@ import mediapipe as mp
 import numpy as np
 from tensorflow.keras.models import load_model
 import collections
+import random
+import time
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-MODEL_PATH      = "signmath_model.h5"
-GESTURES        = ["one", "two", "plus", "three", "four", "five",
-                   "six", "seven", "eight", "nine", "ten"]
-SEQUENCE_LENGTH = 30
-LANDMARK_SIZE   = 126
-CONFIDENCE_THRESHOLD = 0.85   # only show prediction if confidence >= this
+MODEL_PATH           = "signmath_model.h5"
+GESTURES             = ["one", "two", "three", "four", "five",
+                        "six", "seven", "eight", "nine", "ten", "plus"]
+SEQUENCE_LENGTH      = 30
+LANDMARK_SIZE        = 126
+CONFIDENCE_THRESHOLD = 0.85
+SMOOTH_WINDOW        = 5
+CORRECT_HOLD_SEC     = 1.5   # pause after correct before moving on
+GESTURE_TIME_LIMIT   = 10    # seconds per gesture attempt
+MAX_ATTEMPTS         = 3     # attempts per gesture before skipping
 # ──────────────────────────────────────────────────────────────────────────────
+
+GESTURE_TO_NUM = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "plus": None,
+}
 
 mp_hands = mp.solutions.hands
 mp_draw  = mp.solutions.drawing_utils
@@ -24,132 +36,393 @@ hands = mp_hands.Hands(
 
 EMPTY_HAND = np.zeros(63)
 
+# ─── PHASES ───────────────────────────────────────────────────────────────────
+# Each question walks through: sign A → sign + → sign B → sign answer
+PHASE_LIST = ["number1", "operator", "number2", "answer"]
+
 
 def extract_landmarks(results):
-    """Same logic as recording — always returns (126,) or None."""
     if not results.multi_hand_landmarks:
         return None
-
-    detected = results.multi_hand_landmarks
-
-    sorted_hands = sorted(detected, key=lambda h: h.landmark[0].x)
-
+    sorted_hands = sorted(results.multi_hand_landmarks, key=lambda h: h.landmark[0].x)
     hand0 = np.array([[lm.x, lm.y, lm.z] for lm in sorted_hands[0].landmark]).flatten()
-
-    if len(sorted_hands) >= 2:
-        hand1 = np.array([[lm.x, lm.y, lm.z] for lm in sorted_hands[1].landmark]).flatten()
-    else:
-        hand1 = EMPTY_HAND
-
+    hand1 = np.array([[lm.x, lm.y, lm.z] for lm in sorted_hands[1].landmark]).flatten() \
+            if len(sorted_hands) >= 2 else EMPTY_HAND
     return np.concatenate([hand0, hand1])
 
 
-def draw_prediction_bar(frame, gesture, confidence):
-    """Draw a confidence bar at the bottom of the frame."""
+def num_to_word(n):
+    words = {1:"ONE",2:"TWO",3:"THREE",4:"FOUR",5:"FIVE",
+             6:"SIX",7:"SEVEN",8:"EIGHT",9:"NINE",10:"TEN"}
+    return words.get(n, str(n))
+
+
+def generate_question():
+    a = random.randint(1, 9)
+    b = random.randint(1, 10 - a)
+    return a, "+", b, a + b
+
+
+def phase_target(question, phase):
+    """What gesture should the user show for this phase."""
+    a, op, b, answer = question
+    if phase == "number1":   return num_to_word(a)
+    if phase == "operator":  return "PLUS"
+    if phase == "number2":   return num_to_word(b)
+    if phase == "answer":    return num_to_word(answer)
+
+
+def phase_matches(prediction, question, phase):
+    """Check if the prediction satisfies the current phase."""
+    a, op, b, answer = question
+    if phase == "number1":
+        return GESTURE_TO_NUM.get(prediction) == a
+    if phase == "operator":
+        return prediction == "plus"
+    if phase == "number2":
+        return GESTURE_TO_NUM.get(prediction) == b
+    if phase == "answer":
+        return GESTURE_TO_NUM.get(prediction) == answer
+
+
+def draw_timer_ring(frame, cx, cy, radius, fraction, color, thickness=7):
+    cv2.ellipse(frame, (cx, cy), (radius, radius), -90, 0, 360, (60,60,60), thickness)
+    if fraction > 0:
+        cv2.ellipse(frame, (cx, cy), (radius, radius), -90, 0,
+                    int(360 * fraction), color, thickness)
+
+
+def draw_start_screen(frame, score, total):
     h, w = frame.shape[:2]
-    bar_h = 50
-    bar_y = h - bar_h
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, h), (10, 10, 10), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
 
-    # Background
-    cv2.rectangle(frame, (0, bar_y), (w, h), (20, 20, 20), -1)
+    title = "SignMath Quiz"
+    (tw, _), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, 2.0, 3)
+    cv2.putText(frame, title, ((w-tw)//2, h//2 - 80),
+                cv2.FONT_HERSHEY_SIMPLEX, 2.0, (255,220,50), 3)
 
-    # Confidence fill
-    fill_w = int(w * confidence)
-    color = (0, 220, 100) if confidence >= CONFIDENCE_THRESHOLD else (0, 140, 255)
-    cv2.rectangle(frame, (0, bar_y), (fill_w, h), color, -1)
+    rules = [
+        "Sign each part of the equation",
+        f"10 seconds per gesture",
+        f"3 attempts per gesture",
+        "",
+        "Press  SPACE  to start",
+        "Press  Q  to quit",
+    ]
+    for i, line in enumerate(rules):
+        color = (0, 220, 120) if "SPACE" in line else (200, 200, 200)
+        size  = 0.9 if "SPACE" in line else 0.7
+        (lw, _), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, size, 2)
+        cv2.putText(frame, line, ((w-lw)//2, h//2 + i*38),
+                    cv2.FONT_HERSHEY_SIMPLEX, size, color, 2)
 
-    # Text
-    label = f"{gesture.upper()}  {confidence * 100:.1f}%"
-    cv2.putText(frame, label, (16, h - 14),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+    if total > 0:
+        prev = f"Last session: {score}/{total}"
+        (pw, _), _ = cv2.getTextSize(prev, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 1)
+        cv2.putText(frame, prev, ((w-pw)//2, h - 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (140,140,140), 1)
 
 
-def draw_sequence_bar(frame, current, total, y=10):
-    """Small bar at the top showing how full the buffer is."""
+def draw_game_ui(frame, question, phase, prediction, confidence,
+                 score, total, attempts, status, status_color,
+                 correct_time, gesture_start, seq_len):
+
     h, w = frame.shape[:2]
-    bar_w = w - 20
-    filled = int(bar_w * current / total)
-    cv2.rectangle(frame, (10, y), (10 + bar_w, y + 8), (40, 40, 40), -1)
-    cv2.rectangle(frame, (10, y), (10 + filled, y + 8), (100, 180, 255), -1)
+    a, op, b, answer = question
+
+    # ── Header ──────────────────────────────────────────────────────────────
+    cv2.rectangle(frame, (0, 0), (w, 72), (20, 20, 20), -1)
+    cv2.putText(frame, f"Score: {score} / {total}", (16, 48),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255, 220, 50), 2)
+
+    # Attempts dots
+    dot_x = w - 160
+    for i in range(MAX_ATTEMPTS):
+        color = (0, 200, 100) if i < (MAX_ATTEMPTS - attempts) else (80, 80, 80)
+        cv2.circle(frame, (dot_x + i * 30, 35), 10, color, -1)
+    cv2.putText(frame, "attempts", (dot_x - 10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (140,140,140), 1)
+
+    # Buffer bar
+    bw = w - 20
+    cv2.rectangle(frame, (10, 74), (10+bw, 82), (40,40,40), -1)
+    cv2.rectangle(frame, (10, 74),
+                  (10 + int(bw * min(seq_len, SEQUENCE_LENGTH) / SEQUENCE_LENGTH), 82),
+                  (100, 180, 255), -1)
+
+    # ── Question ─────────────────────────────────────────────────────────────
+    q_text = f"{a}  +  {b}  =  ?"
+    fs, th = 2.6, 4
+    (tw, _), _ = cv2.getTextSize(q_text, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
+    cv2.putText(frame, q_text, ((w-tw)//2 + 2, 162),
+                cv2.FONT_HERSHEY_SIMPLEX, fs, (0,0,0), th+2)
+    cv2.putText(frame, q_text, ((w-tw)//2, 160),
+                cv2.FONT_HERSHEY_SIMPLEX, fs, (255,255,255), th)
+
+    # ── Phase instruction ────────────────────────────────────────────────────
+    target = phase_target(question, phase)
+    if phase == "answer":
+        inst = f"Now sign the answer:  {target}"
+        ic   = (100, 255, 140)
+    elif phase == "operator":
+        inst = f"Sign the operator:  {target}"
+        ic   = (255, 180, 50)
+    else:
+        inst = f"Sign:  {target}"
+        ic   = (100, 220, 255)
+
+    (iw, _), _ = cv2.getTextSize(inst, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+    cv2.putText(frame, inst, ((w-iw)//2, 205),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, ic, 2)
+
+    # ── Timer ring ───────────────────────────────────────────────────────────
+    if gesture_start is not None and correct_time is None:
+        elapsed   = time.time() - gesture_start
+        remaining = max(0.0, GESTURE_TIME_LIMIT - elapsed)
+        fraction  = remaining / GESTURE_TIME_LIMIT
+        cx, cy    = w // 2, h // 2 + 40
+        r         = 55
+
+        ring_color = (0,220,100) if fraction > 0.5 else \
+                     (0,180,255) if fraction > 0.25 else (0,60,255)
+
+        draw_timer_ring(frame, cx, cy, r, fraction, ring_color)
+        sec_text = f"{remaining:.1f}"
+        (stw, sth), _ = cv2.getTextSize(sec_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+        cv2.putText(frame, sec_text, (cx - stw//2, cy + sth//2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+
+    # ── Status ───────────────────────────────────────────────────────────────
+    if status:
+        (sw, _), _ = cv2.getTextSize(status, cv2.FONT_HERSHEY_SIMPLEX, 1.1, 3)
+        sy = h - 110
+        cv2.putText(frame, status, ((w-sw)//2 + 2, sy+2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0,0,0), 5)
+        cv2.putText(frame, status, ((w-sw)//2, sy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.1, status_color, 3)
+
+        if correct_time is not None:
+            elapsed  = time.time() - correct_time
+            fraction = min(elapsed / CORRECT_HOLD_SEC, 1.0)
+            bw2      = 260
+            bx       = (w - bw2) // 2
+            by       = sy + 14
+            cv2.rectangle(frame, (bx, by), (bx+bw2, by+8), (60,60,60), -1)
+            cv2.rectangle(frame, (bx, by),
+                          (bx+int(bw2*fraction), by+8), (0,220,100), -1)
+
+    # ── Bottom prediction ─────────────────────────────────────────────────────
+    bar_y = h - 52
+    cv2.rectangle(frame, (0, bar_y), (w, h), (20,20,20), -1)
+    if prediction and confidence >= CONFIDENCE_THRESHOLD:
+        cv2.rectangle(frame, (0, bar_y),
+                      (int(w * confidence), h), (40,100,200), -1)
+        label = f"Detected: {prediction.upper()}   {confidence*100:.0f}%"
+    else:
+        label = "Show your hand..."
+    cv2.putText(frame, label, (16, h-14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255,255,255), 2)
+
+    # Hand count
+    hc = len(results.multi_hand_landmarks) if results.multi_hand_landmarks else 0
+    cv2.putText(frame, f"Hands: {hc}", (16, 36),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (160,160,160), 1)
 
 
 # ─── LOAD MODEL ───────────────────────────────────────────────────────────────
 print("Loading model...")
 model = load_model(MODEL_PATH)
-print(f"Model loaded — input shape: {model.input_shape}")
+print(f"Model loaded.\nGestures: {GESTURES}\n")
 
-# ─── STATE ────────────────────────────────────────────────────────────────────
-sequence   = collections.deque(maxlen=SEQUENCE_LENGTH)  # sliding window
-prediction = None
-confidence = 0.0
-
-# Smoothing: keep last N predictions and pick the majority
-SMOOTH_WINDOW = 5
+# ─── GLOBAL STATE ─────────────────────────────────────────────────────────────
+sequence     = collections.deque(maxlen=SEQUENCE_LENGTH)
 recent_preds = collections.deque(maxlen=SMOOTH_WINDOW)
+prediction   = None
+confidence   = 0.0
+
+score        = 0
+total        = 0
+question     = generate_question()
+
+phase_idx    = 0
+phase        = PHASE_LIST[phase_idx]
+attempts     = MAX_ATTEMPTS          # remaining attempts for current gesture
+
+status       = ""
+status_color = (255,255,255)
+correct_time = None
+waiting_next = False
+gesture_start = None
+
+# ─── SCREENS ──────────────────────────────────────────────────────────────────
+SCREEN_START = "start"
+SCREEN_GAME  = "game"
+screen       = SCREEN_START
+
+
+def begin_gesture():
+    """Reset buffer and timer for a fresh attempt."""
+    global gesture_start, sequence, recent_preds, prediction, status
+    gesture_start = time.time()
+    sequence.clear()
+    recent_preds.clear()
+    prediction = None
+    status     = ""
+
+
+def next_phase():
+    """Advance to the next phase of the current question."""
+    global phase_idx, phase, attempts, status, status_color
+    phase_idx += 1
+    phase      = PHASE_LIST[phase_idx]
+    attempts   = MAX_ATTEMPTS
+    status     = ""
+    status_color = (255,255,255)
+    begin_gesture()
+
+
+def next_question():
+    """Load a fresh question and reset all state."""
+    global question, phase_idx, phase, attempts
+    global status, status_color, correct_time, waiting_next
+    question     = generate_question()
+    phase_idx    = 0
+    phase        = PHASE_LIST[phase_idx]
+    attempts     = MAX_ATTEMPTS
+    status       = ""
+    status_color = (255,255,255)
+    correct_time = None
+    waiting_next = False
+    begin_gesture()
+
 
 cap = cv2.VideoCapture(0)
 if not cap.isOpened():
     print("ERROR: Could not open camera.")
     exit()
 
-print("\nRunning — press Q or ESC to quit\n")
+print("Press SPACE on the start screen to begin. Q/ESC to quit.\n")
 
 while True:
     ret, frame = cap.read()
     if not ret:
         break
 
-    frame = cv2.flip(frame, 1)
-    rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame   = cv2.flip(frame, 1)
+    rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = hands.process(rgb)
 
-    # Draw skeleton
     if results.multi_hand_landmarks:
         for hl in results.multi_hand_landmarks:
             mp_draw.draw_landmarks(frame, hl, mp_hands.HAND_CONNECTIONS)
 
-    # Extract landmarks and fill buffer
-    landmarks = extract_landmarks(results)
-    if landmarks is not None:
-        sequence.append(landmarks)
+    # ════════════════════════════════════════════════════════════════════════
+    if screen == SCREEN_START:
+        draw_start_screen(frame, score, total)
 
-    # Buffer fill indicator (top bar)
-    draw_sequence_bar(frame, len(sequence), SEQUENCE_LENGTH, y=10)
+    # ════════════════════════════════════════════════════════════════════════
+    elif screen == SCREEN_GAME:
 
-    # Run inference once buffer is full
-    if len(sequence) == SEQUENCE_LENGTH:
-        input_data = np.expand_dims(np.array(sequence), axis=0)  # (1, 30, 126)
-        probs      = model.predict(input_data, verbose=0)[0]
-        pred_idx   = int(np.argmax(probs))
-        confidence = float(probs[pred_idx])
+        # ── Auto-advance after correct / failed gesture ──────────────────
+        if waiting_next and correct_time is not None:
+            if time.time() - correct_time >= CORRECT_HOLD_SEC:
+                next_question()
 
-        recent_preds.append(pred_idx)
+        # ── Timer check ──────────────────────────────────────────────────
+        if not waiting_next and gesture_start is not None:
+            elapsed = time.time() - gesture_start
+            if elapsed >= GESTURE_TIME_LIMIT:
+                attempts -= 1
+                if attempts <= 0:
+                    # Out of attempts — skip this question
+                    _, _, _, answer = question
+                    total       += 1
+                    status       = f"Out of attempts!  Answer: {answer}"
+                    status_color = (0, 60, 220)
+                    correct_time = time.time()
+                    waiting_next = True
+                    print(f"  ✗ OUT OF ATTEMPTS  Answer:{answer}  {score}/{total}")
+                else:
+                    status       = f"Time's up! {attempts} attempt(s) left"
+                    status_color = (0, 140, 255)
+                    begin_gesture()   # restart timer, same gesture
 
-        # Majority vote across recent predictions for stability
-        smoothed_idx = max(set(recent_preds), key=list(recent_preds).count)
-        prediction   = GESTURES[smoothed_idx]
+        # ── Landmarks & inference ─────────────────────────────────────────
+        landmarks = extract_landmarks(results)
+        if landmarks is not None:
+            sequence.append(landmarks)
 
-        draw_prediction_bar(frame, prediction, confidence)
+        if len(sequence) == SEQUENCE_LENGTH and not waiting_next:
+            input_data = np.expand_dims(np.array(sequence), axis=0)
+            probs      = model.predict(input_data, verbose=0)[0]
+            pred_idx   = int(np.argmax(probs))
+            confidence = float(probs[pred_idx])
 
-        # Console log
-        print(f"  {prediction.upper():>6}  {confidence * 100:.1f}%  "
-              f"  raw: {[f'{p*100:.0f}%' for p in probs]}")
+            recent_preds.append(pred_idx)
+            smoothed_idx = max(set(recent_preds), key=list(recent_preds).count)
+            prediction   = GESTURES[smoothed_idx]
 
-    elif prediction is not None:
-        # Keep showing last prediction while buffer refills
-        draw_prediction_bar(frame, prediction, confidence)
+            if confidence >= CONFIDENCE_THRESHOLD:
+                if phase_matches(prediction, question, phase):
+                    # ── Correct gesture ──────────────────────────────────
+                    if phase == "answer":
+                        score       += 1
+                        total       += 1
+                        _, _, _, ans = question
+                        status       = f"CORRECT!   Answer = {ans}"
+                        status_color = (0, 220, 80)
+                        correct_time = time.time()
+                        waiting_next = True
+                        gesture_start = None
+                        print(f"  ✓ CORRECT [{prediction}]  {score}/{total}")
+                    else:
+                        tgt          = phase_target(question,
+                                                    PHASE_LIST[phase_idx + 1])
+                        status       = f"✓ {prediction.upper()}! Now sign: {tgt}"
+                        status_color = (0, 200, 80)
+                        print(f"  ✓ phase={phase} [{prediction}]")
+                        next_phase()
+                else:
+                    # ── Wrong gesture ────────────────────────────────────
+                    signed_val = GESTURE_TO_NUM.get(prediction, "?")
+                    status       = f"Wrong: got {prediction.upper()} — try again!"
+                    status_color = (0, 60, 255)
 
-    # Hand count indicator
-    hand_count = len(results.multi_hand_landmarks) if results.multi_hand_landmarks else 0
-    cv2.putText(frame, f"Hands: {hand_count}", (16, 38),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1)
+        # ── Draw game UI ─────────────────────────────────────────────────
+        draw_game_ui(frame, question, phase, prediction, confidence,
+                     score, total, attempts, status, status_color,
+                     correct_time, gesture_start, len(sequence))
 
-    cv2.imshow("SignMath — Live", frame)
+    cv2.imshow("SignMath — Quiz", frame)
 
     key = cv2.waitKey(1) & 0xFF
-    if key in (ord('q'), ord('Q'), 27):
+
+    if key in (27, ord('q'), ord('Q')):
         break
+
+    if screen == SCREEN_START:
+        if key == ord(' '):
+            screen = SCREEN_GAME
+            score  = 0
+            total  = 0
+            next_question()
+            print("Game started!\n")
+
+    elif screen == SCREEN_GAME:
+        if key == ord('n'):          # manual skip
+            total += 1
+            next_question()
+            print(f"  → Skipped  {score}/{total}")
+        if key == ord('m'):          # back to menu
+            screen = SCREEN_START
 
 cap.release()
 cv2.destroyAllWindows()
-print("Done.")
+
+print(f"\n{'═'*35}")
+print(f"  Final Score : {score} / {total}")
+if total > 0:
+    print(f"  Accuracy    : {score/total*100:.1f}%")
+print(f"{'═'*35}\n")
