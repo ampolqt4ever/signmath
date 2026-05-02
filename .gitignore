@@ -1,0 +1,8 @@
+# 1. Make sure .gitignore has the right entries
+@"
+signmath_env/
+__pycache__/
+*.pyc
+*.pyd
+*.dll
+"@ | Out-File -Append -Encoding utf8 .gitignore
