@@ -8,15 +8,13 @@ import time
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 MODEL_PATH           = "signmath_model.h5"
-GESTURES             = ["one", "two", "three", "four", "five",
-                        "six", "seven", "eight", "nine", "ten", "plus"]
+GESTURES             = ["one", "two", "plus", "three", "four", "five",
+                        "six", "seven", "eight", "nine", "ten"]  # FIXED: matches train.py order
 SEQUENCE_LENGTH      = 30
 LANDMARK_SIZE        = 126
 CONFIDENCE_THRESHOLD = 0.85
 SMOOTH_WINDOW        = 5
 CORRECT_HOLD_SEC     = 1.5   # pause after correct before moving on
-GESTURE_TIME_LIMIT   = 10    # seconds per gesture attempt
-MAX_ATTEMPTS         = 3     # attempts per gesture before skipping
 # ──────────────────────────────────────────────────────────────────────────────
 
 GESTURE_TO_NUM = {
@@ -126,8 +124,8 @@ def draw_start_screen(frame, score, total):
 
 
 def draw_game_ui(frame, question, phase, prediction, confidence,
-                 score, total, attempts, status, status_color,
-                 correct_time, gesture_start, seq_len):
+                 score, total, status, status_color,
+                 correct_time, seq_len, pred_time):
 
     h, w = frame.shape[:2]
     a, op, b, answer = question
@@ -136,21 +134,6 @@ def draw_game_ui(frame, question, phase, prediction, confidence,
     cv2.rectangle(frame, (0, 0), (w, 72), (20, 20, 20), -1)
     cv2.putText(frame, f"Score: {score} / {total}", (16, 48),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255, 220, 50), 2)
-
-    # Attempts dots
-    dot_x = w - 160
-    for i in range(MAX_ATTEMPTS):
-        color = (0, 200, 100) if i < (MAX_ATTEMPTS - attempts) else (80, 80, 80)
-        cv2.circle(frame, (dot_x + i * 30, 35), 10, color, -1)
-    cv2.putText(frame, "attempts", (dot_x - 10, 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (140,140,140), 1)
-
-    # Buffer bar
-    bw = w - 20
-    cv2.rectangle(frame, (10, 74), (10+bw, 82), (40,40,40), -1)
-    cv2.rectangle(frame, (10, 74),
-                  (10 + int(bw * min(seq_len, SEQUENCE_LENGTH) / SEQUENCE_LENGTH), 82),
-                  (100, 180, 255), -1)
 
     # ── Question ─────────────────────────────────────────────────────────────
     q_text = f"{a}  +  {b}  =  ?"
@@ -177,22 +160,14 @@ def draw_game_ui(frame, question, phase, prediction, confidence,
     cv2.putText(frame, inst, ((w-iw)//2, 205),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, ic, 2)
 
-    # ── Timer ring ───────────────────────────────────────────────────────────
-    if gesture_start is not None and correct_time is None:
-        elapsed   = time.time() - gesture_start
-        remaining = max(0.0, GESTURE_TIME_LIMIT - elapsed)
-        fraction  = remaining / GESTURE_TIME_LIMIT
-        cx, cy    = w // 2, h // 2 + 40
-        r         = 55
-
-        ring_color = (0,220,100) if fraction > 0.5 else \
-                     (0,180,255) if fraction > 0.25 else (0,60,255)
-
-        draw_timer_ring(frame, cx, cy, r, fraction, ring_color)
-        sec_text = f"{remaining:.1f}"
-        (stw, sth), _ = cv2.getTextSize(sec_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
-        cv2.putText(frame, sec_text, (cx - stw//2, cy + sth//2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+    # ── Buffer bar ───────────────────────────────────────────────────────────
+    bw = w - 20
+    cv2.rectangle(frame, (10, 110), (10+bw, 118), (40,40,40), -1)
+    cv2.rectangle(frame, (10, 110),
+                  (10 + int(bw * min(seq_len, SEQUENCE_LENGTH) / SEQUENCE_LENGTH), 118),
+                  (100, 180, 255), -1)
+    cv2.putText(frame, f"Frames: {seq_len} / {SEQUENCE_LENGTH}", (16, 135),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150,150,150), 1)
 
     # ── Status ───────────────────────────────────────────────────────────────
     if status:
@@ -219,7 +194,7 @@ def draw_game_ui(frame, question, phase, prediction, confidence,
     if prediction and confidence >= CONFIDENCE_THRESHOLD:
         cv2.rectangle(frame, (0, bar_y),
                       (int(w * confidence), h), (40,100,200), -1)
-        label = f"Detected: {prediction.upper()}   {confidence*100:.0f}%"
+        label = f"Detected: {prediction.upper()}   {confidence*100:.0f}%   ({pred_time:.2f}s)"
     else:
         label = "Show your hand..."
     cv2.putText(frame, label, (16, h-14),
@@ -231,10 +206,14 @@ def draw_game_ui(frame, question, phase, prediction, confidence,
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (160,160,160), 1)
 
 
-# ─── LOAD MODEL ───────────────────────────────────────────────────────────────
+# ─── LOAD MODEL & NORMALIZATION STATS ─────────────────────────────────────────
 print("Loading model...")
 model = load_model(MODEL_PATH)
 print(f"Model loaded.\nGestures: {GESTURES}\n")
+
+# Load normalization statistics
+NORM_MEAN = np.load("norm_mean.npy")
+NORM_STD = np.load("norm_std.npy")
 
 # ─── GLOBAL STATE ─────────────────────────────────────────────────────────────
 sequence     = collections.deque(maxlen=SEQUENCE_LENGTH)
@@ -248,13 +227,12 @@ question     = generate_question()
 
 phase_idx    = 0
 phase        = PHASE_LIST[phase_idx]
-attempts     = MAX_ATTEMPTS          # remaining attempts for current gesture
 
 status       = ""
 status_color = (255,255,255)
 correct_time = None
 waiting_next = False
-gesture_start = None
+pred_start_time = None
 
 # ─── SCREENS ──────────────────────────────────────────────────────────────────
 SCREEN_START = "start"
@@ -263,9 +241,9 @@ screen       = SCREEN_START
 
 
 def begin_gesture():
-    """Reset buffer and timer for a fresh attempt."""
-    global gesture_start, sequence, recent_preds, prediction, status
-    gesture_start = time.time()
+    """Reset buffer for a fresh attempt."""
+    global pred_start_time, sequence, recent_preds, prediction, status
+    pred_start_time = time.time()
     sequence.clear()
     recent_preds.clear()
     prediction = None
@@ -274,10 +252,9 @@ def begin_gesture():
 
 def next_phase():
     """Advance to the next phase of the current question."""
-    global phase_idx, phase, attempts, status, status_color
+    global phase_idx, phase, status, status_color
     phase_idx += 1
     phase      = PHASE_LIST[phase_idx]
-    attempts   = MAX_ATTEMPTS
     status     = ""
     status_color = (255,255,255)
     begin_gesture()
@@ -285,12 +262,11 @@ def next_phase():
 
 def next_question():
     """Load a fresh question and reset all state."""
-    global question, phase_idx, phase, attempts
+    global question, phase_idx, phase
     global status, status_color, correct_time, waiting_next
     question     = generate_question()
     phase_idx    = 0
     phase        = PHASE_LIST[phase_idx]
-    attempts     = MAX_ATTEMPTS
     status       = ""
     status_color = (255,255,255)
     correct_time = None
@@ -325,37 +301,23 @@ while True:
     # ════════════════════════════════════════════════════════════════════════
     elif screen == SCREEN_GAME:
 
-        # ── Auto-advance after correct / failed gesture ──────────────────
+        # ── Auto-advance after correct gesture ──────────────────────────────
         if waiting_next and correct_time is not None:
             if time.time() - correct_time >= CORRECT_HOLD_SEC:
                 next_question()
-
-        # ── Timer check ──────────────────────────────────────────────────
-        if not waiting_next and gesture_start is not None:
-            elapsed = time.time() - gesture_start
-            if elapsed >= GESTURE_TIME_LIMIT:
-                attempts -= 1
-                if attempts <= 0:
-                    # Out of attempts — skip this question
-                    _, _, _, answer = question
-                    total       += 1
-                    status       = f"Out of attempts!  Answer: {answer}"
-                    status_color = (0, 60, 220)
-                    correct_time = time.time()
-                    waiting_next = True
-                    print(f"  ✗ OUT OF ATTEMPTS  Answer:{answer}  {score}/{total}")
-                else:
-                    status       = f"Time's up! {attempts} attempt(s) left"
-                    status_color = (0, 140, 255)
-                    begin_gesture()   # restart timer, same gesture
 
         # ── Landmarks & inference ─────────────────────────────────────────
         landmarks = extract_landmarks(results)
         if landmarks is not None:
             sequence.append(landmarks)
 
+        pred_time = time.time() - pred_start_time if pred_start_time else 0
+
         if len(sequence) == SEQUENCE_LENGTH and not waiting_next:
-            input_data = np.expand_dims(np.array(sequence), axis=0)
+            # Normalize sequence using training statistics
+            seq_array = np.array(sequence)
+            seq_normalized = (seq_array - NORM_MEAN) / (NORM_STD + 1e-8)
+            input_data = np.expand_dims(seq_normalized, axis=0)
             probs      = model.predict(input_data, verbose=0)[0]
             pred_idx   = int(np.argmax(probs))
             confidence = float(probs[pred_idx])
@@ -375,14 +337,13 @@ while True:
                         status_color = (0, 220, 80)
                         correct_time = time.time()
                         waiting_next = True
-                        gesture_start = None
-                        print(f"  ✓ CORRECT [{prediction}]  {score}/{total}")
+                        print(f"  ✓ CORRECT [{prediction}]  {score}/{total}  ({pred_time:.2f}s)")
                     else:
                         tgt          = phase_target(question,
                                                     PHASE_LIST[phase_idx + 1])
                         status       = f"✓ {prediction.upper()}! Now sign: {tgt}"
                         status_color = (0, 200, 80)
-                        print(f"  ✓ phase={phase} [{prediction}]")
+                        print(f"  ✓ phase={phase} [{prediction}]  ({pred_time:.2f}s)")
                         next_phase()
                 else:
                     # ── Wrong gesture ────────────────────────────────────
@@ -392,8 +353,8 @@ while True:
 
         # ── Draw game UI ─────────────────────────────────────────────────
         draw_game_ui(frame, question, phase, prediction, confidence,
-                     score, total, attempts, status, status_color,
-                     correct_time, gesture_start, len(sequence))
+                     score, total, status, status_color,
+                     correct_time, len(sequence), pred_time)
 
     cv2.imshow("SignMath — Quiz", frame)
 
