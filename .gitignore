@@ -1,8 +1,13 @@
-# 1. Make sure .gitignore has the right entries
-@"
+# Ignore Python virtual environment and generated files
 signmath_env/
 __pycache__/
 *.pyc
 *.pyd
 *.dll
-"@ | Out-File -Append -Encoding utf8 .gitignore
+
+# Ignore dataset and model artifacts
+dataset/
+signmath_model.h5
+norm_mean.npy
+norm_std.npy
+training_results.png

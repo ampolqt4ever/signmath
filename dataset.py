@@ -7,10 +7,13 @@ import time
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 GESTURES = ["one", "two", "plus", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]
 SEQUENCE_LENGTH = 30        # frames per sample
-SAMPLES_PER_CLASS = 50      # samples per gesture
+SAMPLES_PER_CLASS = 70      # fewer but cleaner samples per gesture
 DATASET_DIR = "dataset"
 LANDMARK_SIZE = 126         # always 126: 2 hands × 21 landmarks × 3 (x,y,z)
                             # if only 1 hand visible, second hand = zeros
+MIN_DETECTED_FRAMES = 25     # require most frames to contain valid landmarks
+MIN_HAND_CONFIDENCE = 0.6    # ignore very weak detections
+MAX_RETRIES_PER_SAMPLE = 3   # allow a few attempts before skipping
 
 # How many hands each gesture needs (used for the warning overlay only)
 GESTURE_HANDS = {
@@ -133,8 +136,10 @@ def wait_for_space(cap, gesture, sample, total_samples):
 def record_sample(cap, gesture, sample):
     sequence = []
     req = GESTURE_HANDS[gesture]
+    last_good_frame = None
+    attempts = 0
 
-    while len(sequence) < SEQUENCE_LENGTH:
+    while len(sequence) < SEQUENCE_LENGTH and attempts < MAX_RETRIES_PER_SAMPLE:
         ret, frame = cap.read()
         if not ret:
             break
@@ -152,6 +157,7 @@ def record_sample(cap, gesture, sample):
 
         if landmarks is not None:
             sequence.append(landmarks)
+            last_good_frame = frame.copy()
 
         # UI
         status = f"Recording: {gesture.upper()}  |  Sample {sample + 1} / {SAMPLES_PER_CLASS}"
@@ -166,10 +172,25 @@ def record_sample(cap, gesture, sample):
             msg = "Show both hands!" if req == 2 else "No hand detected — show your hand!"
             cv2.putText(frame, msg, (40, 155),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 80, 255), 2)
+        else:
+            cv2.putText(frame, "Good pose — hold still", (40, 155),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 120), 2)
 
         cv2.imshow("Gesture Recorder", frame)
-        if cv2.waitKey(1) & 0xFF == 27:
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27:
             return None
+        if key == ord('r'):
+            sequence.clear()
+            attempts += 1
+            cv2.putText(frame, "Resetting sample...", (40, 185),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 180, 60), 2)
+            cv2.imshow("Gesture Recorder", frame)
+            cv2.waitKey(300)
+
+    if len(sequence) < MIN_DETECTED_FRAMES:
+        print(f"  [{gesture}] sample {sample + 1} rejected — too few valid frames")
+        return None
 
     return np.array(sequence)  # shape: (30, 126)
 
@@ -215,10 +236,8 @@ def main():
                 sequence = record_sample(cap, gesture, sample)
 
                 if sequence is None:
-                    print("Aborted mid-recording.")
-                    cap.release()
-                    cv2.destroyAllWindows()
-                    return
+                    print("Aborted or sample rejected.")
+                    continue
 
                 np.save(save_path, sequence)
                 print(f"  [{gesture}] sample {sample:02d} saved — shape {sequence.shape}")

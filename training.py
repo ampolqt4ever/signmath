@@ -3,6 +3,9 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+tf.keras.utils.set_random_seed(42)
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
@@ -58,14 +61,19 @@ for i, g in enumerate(GESTURES):
 
 
 # ─── 2. SPLIT ─────────────────────────────────────────────────────────────────
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42, stratify=y
+X_train, X_temp, y_train, y_temp = train_test_split(
+    X, y, test_size=0.3, random_state=42, stratify=y
+)
+X_val, X_test, y_val, y_test = train_test_split(
+    X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp
 )
 
 y_train_cat = to_categorical(y_train, num_classes=len(GESTURES))
+y_val_cat   = to_categorical(y_val,   num_classes=len(GESTURES))
 y_test_cat  = to_categorical(y_test,  num_classes=len(GESTURES))
 
 print(f"\n  Train : {X_train.shape[0]} samples")
+print(f"  Val   : {X_val.shape[0]} samples")
 print(f"  Test  : {X_test.shape[0]} samples")
 
 # Compute class weights
@@ -126,7 +134,7 @@ callbacks = [
 
 history = model.fit(
     X_train, y_train_cat,
-    validation_data=(X_test, y_test_cat),
+    validation_data=(X_val, y_val_cat),
     epochs=200,
     batch_size=8,
     class_weight=class_weight_dict,

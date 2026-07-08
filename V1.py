@@ -15,6 +15,7 @@ LANDMARK_SIZE        = 126
 CONFIDENCE_THRESHOLD = 0.85
 SMOOTH_WINDOW        = 5
 CORRECT_HOLD_SEC     = 1.5   # pause after correct before moving on
+HOLD_CONFIRM_SEC     = 0.8   # require the same gesture to stay stable before accepting
 # ──────────────────────────────────────────────────────────────────────────────
 
 GESTURE_TO_NUM = {
@@ -39,10 +40,14 @@ EMPTY_HAND = np.zeros(63)
 PHASE_LIST = ["number1", "operator", "number2", "answer"]
 
 
-def extract_landmarks(results):
+def extract_landmarks(results, required_hands=1):
     if not results.multi_hand_landmarks:
         return None
+
     sorted_hands = sorted(results.multi_hand_landmarks, key=lambda h: h.landmark[0].x)
+    if len(sorted_hands) < required_hands:
+        return None
+
     hand0 = np.array([[lm.x, lm.y, lm.z] for lm in sorted_hands[0].landmark]).flatten()
     hand1 = np.array([[lm.x, lm.y, lm.z] for lm in sorted_hands[1].landmark]).flatten() \
             if len(sorted_hands) >= 2 else EMPTY_HAND
@@ -124,7 +129,7 @@ def draw_start_screen(frame, score, total):
 
 
 def draw_game_ui(frame, question, phase, prediction, confidence,
-                 score, total, status, status_color,
+                 score, total, status, status_color, hold_message,
                  correct_time, seq_len, pred_time):
 
     h, w = frame.shape[:2]
@@ -188,15 +193,21 @@ def draw_game_ui(frame, question, phase, prediction, confidence,
             cv2.rectangle(frame, (bx, by),
                           (bx+int(bw2*fraction), by+8), (0,220,100), -1)
 
+    # ── Hold cue ────────────────────────────────────────────────────────────
+    if hold_message:
+        (hw, _), _ = cv2.getTextSize(hold_message, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+        cv2.putText(frame, hold_message, ((w-hw)//2, h-88),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,180,60), 2)
+
     # ── Bottom prediction ─────────────────────────────────────────────────────
     bar_y = h - 52
     cv2.rectangle(frame, (0, bar_y), (w, h), (20,20,20), -1)
     if prediction and confidence >= CONFIDENCE_THRESHOLD:
         cv2.rectangle(frame, (0, bar_y),
                       (int(w * confidence), h), (40,100,200), -1)
-        label = f"Detected: {prediction.upper()}   {confidence*100:.0f}%   ({pred_time:.2f}s)"
+        label = f"Prediction: {prediction.upper()}  Accuracy: {confidence*100:.0f}%"
     else:
-        label = "Show your hand..."
+        label = "Prediction: waiting..."
     cv2.putText(frame, label, (16, h-14),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255,255,255), 2)
 
@@ -217,9 +228,12 @@ NORM_STD = np.load("norm_std.npy")
 
 # ─── GLOBAL STATE ─────────────────────────────────────────────────────────────
 sequence     = collections.deque(maxlen=SEQUENCE_LENGTH)
-recent_preds = collections.deque(maxlen=SMOOTH_WINDOW)
+recent_probs = collections.deque(maxlen=SMOOTH_WINDOW)
 prediction   = None
 confidence   = 0.0
+pending_prediction = None
+pending_confidence = 0.0
+hold_start_time = None
 
 score        = 0
 total        = 0
@@ -230,6 +244,7 @@ phase        = PHASE_LIST[phase_idx]
 
 status       = ""
 status_color = (255,255,255)
+hold_message = ""
 correct_time = None
 waiting_next = False
 pred_start_time = None
@@ -242,33 +257,40 @@ screen       = SCREEN_START
 
 def begin_gesture():
     """Reset buffer for a fresh attempt."""
-    global pred_start_time, sequence, recent_preds, prediction, status
+    global pred_start_time, sequence, recent_probs, prediction, status
+    global pending_prediction, pending_confidence, hold_start_time, hold_message
     pred_start_time = time.time()
     sequence.clear()
-    recent_preds.clear()
+    recent_probs.clear()
     prediction = None
+    pending_prediction = None
+    pending_confidence = 0.0
+    hold_start_time = None
+    hold_message = ""
     status     = ""
 
 
 def next_phase():
     """Advance to the next phase of the current question."""
-    global phase_idx, phase, status, status_color
+    global phase_idx, phase, status, status_color, hold_message
     phase_idx += 1
     phase      = PHASE_LIST[phase_idx]
     status     = ""
     status_color = (255,255,255)
+    hold_message = ""
     begin_gesture()
 
 
 def next_question():
     """Load a fresh question and reset all state."""
     global question, phase_idx, phase
-    global status, status_color, correct_time, waiting_next
+    global status, status_color, hold_message, correct_time, waiting_next
     question     = generate_question()
     phase_idx    = 0
     phase        = PHASE_LIST[phase_idx]
     status       = ""
     status_color = (255,255,255)
+    hold_message = ""
     correct_time = None
     waiting_next = False
     begin_gesture()
@@ -307,7 +329,8 @@ while True:
                 next_question()
 
         # ── Landmarks & inference ─────────────────────────────────────────
-        landmarks = extract_landmarks(results)
+        required_hands = 2 if phase == "operator" else 1
+        landmarks = extract_landmarks(results, required_hands=required_hands)
         if landmarks is not None:
             sequence.append(landmarks)
 
@@ -319,41 +342,62 @@ while True:
             seq_normalized = (seq_array - NORM_MEAN) / (NORM_STD + 1e-8)
             input_data = np.expand_dims(seq_normalized, axis=0)
             probs      = model.predict(input_data, verbose=0)[0]
-            pred_idx   = int(np.argmax(probs))
-            confidence = float(probs[pred_idx])
-
-            recent_preds.append(pred_idx)
-            smoothed_idx = max(set(recent_preds), key=list(recent_preds).count)
-            prediction   = GESTURES[smoothed_idx]
+            recent_probs.append(probs)
+            avg_probs  = np.mean(np.vstack(recent_probs), axis=0) if recent_probs else probs
+            pred_idx   = int(np.argmax(avg_probs))
+            confidence = float(avg_probs[pred_idx])
+            prediction = GESTURES[pred_idx]
 
             if confidence >= CONFIDENCE_THRESHOLD:
-                if phase_matches(prediction, question, phase):
-                    # ── Correct gesture ──────────────────────────────────
-                    if phase == "answer":
-                        score       += 1
-                        total       += 1
-                        _, _, _, ans = question
-                        status       = f"CORRECT!   Answer = {ans}"
-                        status_color = (0, 220, 80)
-                        correct_time = time.time()
-                        waiting_next = True
-                        print(f"  ✓ CORRECT [{prediction}]  {score}/{total}  ({pred_time:.2f}s)")
+                if prediction != pending_prediction:
+                    pending_prediction = prediction
+                    pending_confidence = confidence
+                    hold_start_time = time.time()
+                    hold_message = "Hold steady..."
+                    status = ""
+                    status_color = (255, 180, 60)
+                elif hold_start_time is not None and (time.time() - hold_start_time) >= HOLD_CONFIRM_SEC:
+                    if phase_matches(prediction, question, phase):
+                        # ── Correct gesture ──────────────────────────────────
+                        if phase == "answer":
+                            score       += 1
+                            total       += 1
+                            _, _, _, ans = question
+                            status       = f"CORRECT!   Answer = {ans}"
+                            status_color = (0, 220, 80)
+                            correct_time = time.time()
+                            waiting_next = True
+                            print(f"  ✓ CORRECT [{prediction}]  {score}/{total}  ({pred_time:.2f}s)")
+                        else:
+                            tgt          = phase_target(question,
+                                                        PHASE_LIST[phase_idx + 1])
+                            status       = f"✓ {prediction.upper()}! Now sign: {tgt}"
+                            status_color = (0, 200, 80)
+                            print(f"  ✓ phase={phase} [{prediction}]  ({pred_time:.2f}s)")
+                            next_phase()
                     else:
-                        tgt          = phase_target(question,
-                                                    PHASE_LIST[phase_idx + 1])
-                        status       = f"✓ {prediction.upper()}! Now sign: {tgt}"
-                        status_color = (0, 200, 80)
-                        print(f"  ✓ phase={phase} [{prediction}]  ({pred_time:.2f}s)")
-                        next_phase()
+                        # ── Wrong gesture ────────────────────────────────────
+                        signed_val = GESTURE_TO_NUM.get(prediction, "?")
+                        status       = f"Wrong: got {prediction.upper()} — try again!"
+                        status_color = (0, 60, 255)
+                    pending_prediction = None
+                    pending_confidence = 0.0
+                    hold_start_time = None
+                    hold_message = ""
                 else:
-                    # ── Wrong gesture ────────────────────────────────────
-                    signed_val = GESTURE_TO_NUM.get(prediction, "?")
-                    status       = f"Wrong: got {prediction.upper()} — try again!"
-                    status_color = (0, 60, 255)
+                    hold_message = "Hold steady..."
+                    status = ""
+                    status_color = (255, 180, 60)
+            else:
+                pending_prediction = None
+                pending_confidence = 0.0
+                hold_start_time = None
+                hold_message = ""
+                status = ""
 
         # ── Draw game UI ─────────────────────────────────────────────────
         draw_game_ui(frame, question, phase, prediction, confidence,
-                     score, total, status, status_color,
+                     score, total, status, status_color, hold_message,
                      correct_time, len(sequence), pred_time)
 
     cv2.imshow("SignMath — Quiz", frame)
